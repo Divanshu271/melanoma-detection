@@ -1,0 +1,7 @@
+archive/
+src/__pycache__/
+__pycache__/
+embeddings/
+.DS_Store
+results/
+logs/

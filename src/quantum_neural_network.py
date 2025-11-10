@@ -11,6 +11,7 @@ from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score
 )
+from metrics_utils import classification_metrics
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -115,6 +116,18 @@ class OptimizedQNN(nn.Module):
             
             nn.Linear(64, 2)
         )
+        # Best decision threshold (for positive class) chosen on validation
+        self.best_threshold = 0.5
+        # Threshold tuning behavior: 'recall' (default) or 'precision' or 'f1'
+        # If 'recall', we maximize recall subject to min_precision.
+        # If 'precision', we maximize precision subject to min_recall.
+        # If 'f1', we maximize F1 directly (no additional constraint used).
+        self.threshold_optimize = 'recall'
+        self.min_precision = 0.5
+        self.min_recall = 0.0
+        # Optional use of focal loss
+        self.use_focal = False
+        self.focal_gamma = 2.0
     
     def _create_feature_extractor(self):
         """Create ResNet feature extractor"""
@@ -160,11 +173,34 @@ class OptimizedQNN(nn.Module):
         )
         
         # Use class weights for balanced loss if provided
-        if class_weights is not None:
-            class_weights = class_weights.to(device)
-            criterion = nn.CrossEntropyLoss(weight=class_weights)
+        if self.use_focal:
+            # implement focal loss with optional class weights
+            class FocalLoss(nn.Module):
+                def __init__(self, gamma=2.0, weight=None):
+                    super().__init__()
+                    self.gamma = gamma
+                    self.weight = weight
+
+                def forward(self, inputs, targets):
+                    # inputs: logits (N, C)
+                    probs = torch.softmax(inputs, dim=1)
+                    targets_one_hot = torch.nn.functional.one_hot(targets, num_classes=probs.size(1)).float()
+                    pt = (probs * targets_one_hot).sum(dim=1)
+                    log_pt = torch.log(pt + 1e-12)
+                    loss = -((1 - pt) ** self.gamma) * log_pt
+                    if self.weight is not None:
+                        wt = self.weight[targets].to(inputs.device)
+                        loss = loss * wt
+                    return loss.mean()
+
+            weight = class_weights.to(device) if class_weights is not None else None
+            criterion = FocalLoss(gamma=self.focal_gamma, weight=weight)
         else:
-            criterion = nn.CrossEntropyLoss()
+            if class_weights is not None:
+                class_weights = class_weights.to(device)
+                criterion = nn.CrossEntropyLoss(weight=class_weights)
+            else:
+                criterion = nn.CrossEntropyLoss()
         
         best_f1 = 0
         best_state = None
@@ -190,7 +226,8 @@ class OptimizedQNN(nn.Module):
                 labels.extend(targets.cpu().numpy())
             
             train_loss /= len(train_loader)
-            train_f1 = f1_score(labels, preds, average='macro')
+            # Use positive-class (binary) F1 for training/validation logging
+            train_f1 = f1_score(labels, preds, average='binary', zero_division=0)
             
             # Validation
             self.eval()
@@ -210,7 +247,7 @@ class OptimizedQNN(nn.Module):
                     labels.extend(targets.cpu().numpy())
             
             val_loss /= len(val_loader)
-            val_f1 = f1_score(labels, preds, average='macro')
+            val_f1 = f1_score(labels, preds, average='binary', zero_division=0)
             
             # Update scheduler
             scheduler.step(val_f1)
@@ -221,12 +258,27 @@ class OptimizedQNN(nn.Module):
                 best_state = self.state_dict().copy()
             
             print(f"Epoch {epoch+1}/{epochs}")
-            print(f"Train Loss: {train_loss:.4f}, F1: {train_f1:.4f}")
-            print(f"Val Loss: {val_loss:.4f}, F1: {val_f1:.4f}")
+            print(f"Train Loss: {train_loss:.4f}, F1 (pos): {train_f1:.4f}")
+            print(f"Val Loss: {val_loss:.4f}, F1 (pos): {val_f1:.4f}")
         
         # Load best model
         if best_state is not None:
             self.load_state_dict(best_state)
+        
+        # After training, compute validation probabilities and find threshold to
+        # maximize recall subject to a minimum precision (helps increase recall)
+        try:
+            if val_loader is not None:
+                self.best_threshold = self._find_threshold_on_loader(
+                    val_loader,
+                    min_precision=self.min_precision,
+                    min_recall=self.min_recall,
+                    optimize_for=self.threshold_optimize
+                )
+                print(f"Selected validation threshold for positive class ({self.threshold_optimize}): {self.best_threshold:.3f}")
+        except Exception:
+            # fallback
+            self.best_threshold = 0.5
     
     def evaluate(self, test_loader):
         """Evaluate model on test set"""
@@ -247,14 +299,94 @@ class OptimizedQNN(nn.Module):
                 all_labels.extend(targets.numpy())
                 all_probs.extend(probs[:, 1].cpu().numpy())
         
-        # Calculate metrics
-        metrics = {
-            'accuracy': accuracy_score(all_labels, all_preds),
-            'balanced_accuracy': balanced_accuracy_score(all_labels, all_preds),
-            'precision': precision_score(all_labels, all_preds),
-            'recall': recall_score(all_labels, all_preds),
-            'f1_score': f1_score(all_labels, all_preds, average='macro'),
-            'auc_roc': roc_auc_score(all_labels, all_probs)
-        }
-        
+        # Instead of using argmax preds, apply the validation-tuned threshold if available
+        try:
+            probs_arr = np.array(all_probs)
+            pred_by_thresh = (probs_arr >= self.best_threshold).astype(int)
+            metrics = classification_metrics(all_labels, pred_by_thresh, probs_arr, pos_label=1)
+        except Exception:
+            metrics = classification_metrics(all_labels, all_preds, np.array(all_probs), pos_label=1)
+
         return metrics
+
+    def _find_threshold_on_loader(self, loader, min_precision=0.5, min_recall=0.0, optimize_for='recall'):
+        """Sweep thresholds on a validation loader and pick the best threshold.
+
+        Parameters
+        - loader: validation DataLoader that yields (images, targets)
+        - min_precision: minimum precision constraint when optimizing for recall
+        - min_recall: minimum recall constraint when optimizing for precision
+        - optimize_for: one of {'recall', 'precision', 'f1'}
+
+        Behavior:
+        - 'recall': choose threshold that maximizes recall while keeping precision >= min_precision.
+        - 'precision': choose threshold that maximizes precision while keeping recall >= min_recall.
+        - 'f1': choose threshold that maximizes F1 (no extra constraint).
+
+        If no threshold satisfies the constraint, the function falls back to the threshold
+        that maximizes the requested objective without the constraint (or 0.5 if something fails).
+        Returns a float threshold in [0,1].
+        """
+        device = next(self.parameters()).device
+        self.eval()
+        all_probs = []
+        all_labels = []
+        with torch.no_grad():
+            for images, targets in loader:
+                images = images.to(device)
+                outputs = self(images)
+                probs = torch.softmax(outputs, dim=1)[:, 1]
+                all_probs.extend(probs.cpu().numpy())
+                all_labels.extend(targets.numpy())
+
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        best_thresh = 0.5
+
+        # candidate arrays
+        thresholds = np.linspace(0.0, 1.0, 101)
+        from sklearn.metrics import precision_score, recall_score, f1_score
+
+        scores = []
+        for t in thresholds:
+            y_pred = (all_probs >= t).astype(int)
+            prec = precision_score(all_labels, y_pred, zero_division=0)
+            rec = recall_score(all_labels, y_pred, zero_division=0)
+            f1 = f1_score(all_labels, y_pred, zero_division=0)
+            scores.append((float(t), float(prec), float(rec), float(f1)))
+
+        # Filter according to requested objective and constraints
+        selected = None
+        if optimize_for == 'recall':
+            # keep thresholds that meet precision constraint
+            valid = [s for s in scores if s[1] >= float(min_precision)]
+            if len(valid) > 0:
+                # maximize recall, tie-breaker: higher precision then higher f1
+                valid.sort(key=lambda x: (x[2], x[1], x[3]), reverse=True)
+                selected = valid[0]
+            else:
+                # fallback: maximize recall regardless of precision
+                scores.sort(key=lambda x: (x[2], x[1], x[3]), reverse=True)
+                selected = scores[0]
+
+        elif optimize_for == 'precision':
+            valid = [s for s in scores if s[2] >= float(min_recall)]
+            if len(valid) > 0:
+                # maximize precision, tie-breaker: higher recall then higher f1
+                valid.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+                selected = valid[0]
+            else:
+                # fallback: maximize precision regardless of recall
+                scores.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+                selected = scores[0]
+
+        else:  # f1
+            scores.sort(key=lambda x: x[3], reverse=True)
+            selected = scores[0]
+
+        try:
+            best_thresh = float(selected[0])
+        except Exception:
+            best_thresh = 0.5
+
+        return float(best_thresh)

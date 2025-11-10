@@ -9,7 +9,7 @@ from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score, 
-    f1_score, balanced_accuracy_score, precision_score, recall_score
+    f1_score, balanced_accuracy_score, precision_score, recall_score, accuracy_score
 )
 from sklearn.utils import resample
 from sklearn.preprocessing import StandardScaler, RobustScaler
@@ -17,6 +17,7 @@ import pennylane as qml
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
+from metrics_utils import classification_metrics
 
 class OptimizedQuantumSVC:
     """
@@ -28,9 +29,15 @@ class OptimizedQuantumSVC:
     3. Memory-efficient parallel circuit execution
     """
     
-    def __init__(self, n_qubits=6, n_pca_components=8, random_state=42, use_hybrid=True, quantum_weight=0.7):
+    def __init__(self, n_qubits=6, n_pca_components=8, n_layers=None, batch_size=64, C=1.0,
+                 random_state=42, use_hybrid=True, quantum_weight=0.7):
         self.n_qubits = n_qubits
         self.n_pca_components = n_pca_components
+        # optional parameters for compatibility with callers
+        self.n_layers = n_layers
+        self.batch_size = batch_size
+        self.C = C
+
         self.random_state = random_state
         self.use_hybrid = use_hybrid  # Combine quantum and classical kernels
         self.quantum_weight = quantum_weight  # Weight for quantum kernel in hybrid
@@ -320,7 +327,8 @@ class OptimizedQuantumSVC:
             
             prec = precision_score(y_true, y_pred, zero_division=0)
             rec = recall_score(y_true, y_pred, zero_division=0)
-            f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+            # Use positive-class (binary) F1 when tuning thresholds
+            f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
             balanced_acc = balanced_accuracy_score(y_true, y_pred)
             
             # Balanced scoring that equally weights precision and recall
@@ -490,24 +498,23 @@ class OptimizedQuantumSVC:
         
         predictions, scores = self.predict(X_test)
         
-        # Metrics
-        accuracy = balanced_accuracy_score(y_test, predictions)
-        precision = precision_score(y_test, predictions, zero_division=0)
-        recall = recall_score(y_test, predictions, zero_division=0)
-        f1 = f1_score(y_test, predictions, average='macro', zero_division=0)
-        
-        try:
-            auc = roc_auc_score(y_test, scores)
-        except:
-            auc = 0.0
-        
-        cm = confusion_matrix(y_test, predictions)
-        
+        # Use centralized metric computation for consistency
+        metrics = classification_metrics(y_test, predictions, scores, pos_label=1)
+
+        cm = metrics['confusion_matrix']
+        accuracy = metrics['accuracy']
+        balanced_acc = metrics['balanced_accuracy']
+        precision = metrics['precision']
+        recall = metrics['recall']
+        f1 = metrics['f1_score']
+        auc = metrics['auc_roc'] if metrics['auc_roc'] is not None else 0.0
+
         print(f"\n--- Test Results ---")
         print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"Balanced Accuracy: {balanced_acc:.4f}")
         print(f"Precision: {precision:.4f} ({precision*100:.2f}%)")
         print(f"Recall: {recall:.4f} ({recall*100:.2f}%)")
-        print(f"F1-Score: {f1:.4f}")
+        print(f"F1-Score (pos): {f1:.4f}")
         print(f"AUC-ROC: {auc:.4f}")
         print(f"\nConfusion Matrix:")
         print(cm)
@@ -525,11 +532,75 @@ class OptimizedQuantumSVC:
         
         return {
             'accuracy': float(accuracy),
+            'balanced_accuracy': float(balanced_acc),
             'precision': float(precision),
             'recall': float(recall),
             'f1_score': float(f1),
+            'f1_macro': float(metrics.get('f1_macro', 0.0)),
             'auc_roc': float(auc),
-            'confusion_matrix': cm.tolist(),  # Convert numpy array to list for JSON
+            'confusion_matrix': cm if isinstance(cm, list) else cm.tolist(),
             'threshold': float(self.best_threshold)
         }
+
+    # Compatibility wrapper used by pipeline: alias fit -> train
+    def fit(self, X_train, y_train, **kwargs):
+        """Compatibility wrapper so pipeline can call fit(X, y).
+
+        If no validation set is provided, uses a small internal split for tuning.
+        """
+        # If user passed validation data via kwargs, use it
+        X_val = kwargs.get('X_val', None)
+        y_val = kwargs.get('y_val', None)
+
+        if X_val is None or y_val is None:
+            # Create a small validation split from the provided training data
+            # stratify by labels
+            from sklearn.model_selection import train_test_split
+            X_tr, X_va, y_tr, y_va = train_test_split(
+                X_train, y_train, test_size=0.2, stratify=y_train, random_state=self.random_state
+            )
+        else:
+            X_tr, y_tr = X_train, y_train
+            X_va, y_va = X_val, y_val
+
+        # Call main training routine with reasonable defaults
+        self.train(
+            X_tr, y_tr, X_va, y_va,
+            n_train_samples=400, n_val_samples=200,
+            C_values=[self.C], cv=3, batch_size=self.batch_size
+        )
+        return self
+
+    def predict_proba(self, X_test, X_train_ref=None):
+        """Return probability estimates for the positive class.
+
+        This uses the trained SVM's predict_proba if available; otherwise
+        approximates probabilities via a sigmoid on the decision function.
+        """
+        # Normalize and PCA
+        X_test_norm = self.scaler.transform(X_test)
+        X_test_pca = self.pca.transform(X_test_norm)
+
+        if X_train_ref is None:
+            if self.X_train_pca is not None:
+                X_train_ref_pca = self.X_train_pca
+            else:
+                raise ValueError("No training reference available for kernel computation")
+        else:
+            X_train_ref_pca = X_train_ref
+
+        K_test = self.hybrid_kernel(X_test_pca, X_train_ref_pca, verbose=False)
+
+        # If classifier supports predict_proba use it
+        try:
+            probs = self.svc.predict_proba(K_test)
+            # return full probability matrix (n_samples, n_classes)
+            return probs
+        except Exception:
+            # Fallback: decision function -> map to (0,1) via sigmoid
+            scores = self.svc.decision_function(K_test)
+            probs = 1.0 / (1.0 + np.exp(-scores))
+            # Return two-column probability matrix [P(class0), P(class1)]
+            probs_matrix = np.vstack([1.0 - probs, probs]).T
+            return probs_matrix
 

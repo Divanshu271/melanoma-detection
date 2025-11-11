@@ -80,8 +80,11 @@ def main():
         X_val = pd.read_csv('embeddings/val_resnet50_embeddings.csv', index_col=0).values
         X_test = pd.read_csv('embeddings/test_resnet50_embeddings.csv', index_col=0).values
         print(f"✓ Embeddings loaded: Train {X_train.shape}, Val {X_val.shape}, Test {X_test.shape}")
-        
-        # Load labels
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"✓ Device: {device}")
+        # Enable CuDNN autotuner for potential performance improvements on fixed-size inputs
+        if device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
         metadata = pd.read_csv('archive/HAM10000_metadata.csv')
         y_all = (metadata['dx'] == 'mel').astype(int).values
         
@@ -147,34 +150,35 @@ def main():
         print(f"Classes - Train: {np.bincount(y_tr)}, Val: {np.bincount(y_va)}, Test: {np.bincount(y_te)}")
         
         # Create data loaders for QNN
-        def make_loader(X, y, batch_size=32, shuffle=False):
+        def make_loader(X, y, batch_size=32, shuffle=False, num_workers=4, pin_memory=True):
             X_img = torch.from_numpy(X).float().unsqueeze(1)
             y_t = torch.from_numpy(y).long()
             ds = TensorDataset(X_img, y_t)
-            return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-        
+            return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                              num_workers=num_workers, pin_memory=pin_memory)
+
         train_loader = make_loader(X_tr, y_tr, shuffle=True)
         val_loader = make_loader(X_va, y_va, shuffle=False)
         test_loader = make_loader(X_te, y_te, shuffle=False)
-        
-        # Initialize ensemble
-        ensemble = HeavyEnsembleClassifier(device=str(device))
-        
-        # Train models
+
+        # Initialize ensemble (pass torch.device object)
+        ensemble = HeavyEnsembleClassifier(device=device)
+
+        # Train models with robust error handling
         try:
             ensemble.train_qnn_fold(train_loader, val_loader, fold_idx)
         except Exception as e:
             print(f"⚠️  QNN training error: {e}")
             print("Continuing without QNN...")
             ensemble.qnn = None
-        
+
         try:
             ensemble.train_qsvc_fold(X_tr, y_tr, X_va, y_va, fold_idx)
         except Exception as e:
             print(f"⚠️  QSVC training error: {e}")
             print("Continuing without QSVC...")
             ensemble.qsvc = None
-        
+
         try:
             ensemble.train_classical_svm(X_tr, y_tr, X_va, y_va)
         except Exception as e:

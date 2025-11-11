@@ -129,6 +129,8 @@ class OptimizedQNN(nn.Module):
         # Optional use of focal loss
         self.use_focal = False
         self.focal_gamma = 2.0
+        # Optional projection layer to map precomputed embeddings -> expected classical_dim
+        self.embedding_proj = None
     
     def _create_feature_extractor(self):
         """Create ResNet feature extractor"""
@@ -149,17 +151,41 @@ class OptimizedQNN(nn.Module):
     def forward(self, x):
         """Forward pass with classical-quantum hybrid processing"""
         batch_size = x.size(0)
-        
-        # Classical features
-        features = self.feature_extractor(x)
-        features = features.view(batch_size, -1)
-        
+
+        # Support both raw image tensors and precomputed embeddings (pseudo-images).
+        # - If input is a 4D tensor with 3 channels (B,3,H,W) assume image and run feature_extractor.
+        # - If input is a 3D tensor shaped (B,1,embedding_dim) or (B, embedding_dim) treat as embeddings
+        #   produced elsewhere (ResNet embeddings). This avoids passing 1-channel pseudo-images
+        #   through the ResNet stem which expects 3 channels.
+        if x.dim() == 4 and x.size(1) == 3:
+            # Classical image path
+            features = self.feature_extractor(x)
+            features = features.view(batch_size, -1)
+        else:
+            # Embedding / pseudo-image path: try to collapse to (batch, classical_dim)
+            if x.dim() == 3 and x.size(1) == 1:
+                # shape (B,1,embedding_dim)
+                features = x.squeeze(1)
+            else:
+                # Any other shape: flatten trailing dims
+                features = x.view(batch_size, -1)
+
+            # If embeddings are smaller than expected, project to expected classical_dim
+            if features.size(1) != self.classical_dim:
+                in_dim = features.size(1)
+                # Create or re-create persistent projection layer if shape differs
+                if self.embedding_proj is None or getattr(self.embedding_proj, 'in_features', None) != in_dim:
+                    self.embedding_proj = nn.Linear(in_dim, self.classical_dim).to(features.device)
+                # Ensure projection lives on the same device
+                if next(self.embedding_proj.parameters()).device != features.device:
+                    self.embedding_proj = self.embedding_proj.to(features.device)
+                features = self.embedding_proj(features.float())
         # Quantum processing
         quantum_out = self.quantum_layer(features)
-        
+
         # Combine classical and quantum features
         combined = torch.cat([quantum_out, features], dim=1)
-        
+
         # Classification
         logits = self.classifier(combined)
         return logits
@@ -213,8 +239,8 @@ class OptimizedQNN(nn.Module):
             preds, labels = [], []
             
             for images, targets in train_loader:
-                images = images.to(device)
-                targets = targets.to(device)
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
                 
                 optimizer.zero_grad()
                 outputs = self(images)
@@ -237,8 +263,8 @@ class OptimizedQNN(nn.Module):
             
             with torch.no_grad():
                 for images, targets in val_loader:
-                    images = images.to(device)
-                    targets = targets.to(device)
+                    images = images.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
                     
                     outputs = self(images)
                     loss = criterion(outputs, targets)
@@ -292,7 +318,7 @@ class OptimizedQNN(nn.Module):
         
         with torch.no_grad():
             for images, targets in test_loader:
-                images = images.to(device)
+                images = images.to(device, non_blocking=True)
                 outputs = self(images)
                 probs = torch.softmax(outputs, dim=1)
                 
@@ -334,7 +360,7 @@ class OptimizedQNN(nn.Module):
         all_labels = []
         with torch.no_grad():
             for images, targets in loader:
-                images = images.to(device)
+                images = images.to(device, non_blocking=True)
                 outputs = self(images)
                 probs = torch.softmax(outputs, dim=1)[:, 1]
                 all_probs.extend(probs.cpu().numpy())

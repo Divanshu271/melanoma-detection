@@ -87,7 +87,7 @@ class ResNet50EmbeddingExtractor:
                     try:
                         # Load and preprocess image
                         image = Image.open(image_path).convert('RGB')
-                        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+                        image_tensor = self.transform(image).unsqueeze(0).to(self.device, non_blocking=True)
                         
                         # Extract features
                         features = self.model(image_tensor)

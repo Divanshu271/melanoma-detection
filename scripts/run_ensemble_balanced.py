@@ -49,6 +49,9 @@ def setup_device():
     else:
         device = torch.device('cpu')
         print("✓ Using CPU")
+    # Enable CuDNN autotuner for potential speedups on fixed-size inputs
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
     return device
 
 
@@ -137,9 +140,12 @@ def prepare_dataloaders(X_train, y_train, X_val, y_val, X_test, y_test,
     test_dataset = TensorDataset(X_test_img, y_test_t)
     
     # Create loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                             num_workers=4, pin_memory=True)
     
     print(f"✓ Train: {len(train_dataset)} samples → {len(train_loader)} batches")
     print(f"✓ Val: {len(val_dataset)} samples → {len(val_loader)} batches")
@@ -179,7 +185,8 @@ def run_cv_fold(fold_idx, train_idx, val_idx, test_idx,
     )
     
     # Initialize and train ensemble
-    ensemble = HeavyEnsembleClassifier(device=str(device))
+    # Pass torch.device object so PyTorch modules are moved correctly
+    ensemble = HeavyEnsembleClassifier(device=device)
     
     # Train QNN
     ensemble.train_qnn_fold(train_loader, val_loader, fold_idx)

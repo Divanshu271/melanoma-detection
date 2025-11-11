@@ -5,12 +5,19 @@ Optimized for >90% precision, recall, and accuracy
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
+
+# Attempt to use cuML GPU SVC, with fallback to sklearn for older GPUs
 try:
     from cuml.svm import SVC as cuMLSVC
-    CUMLOK = True
-except ImportError:
+    CUML_AVAILABLE = True
+except (ImportError, Exception) as e:
+    # Fall back to sklearn SVC if cuML is not available or incompatible
     from sklearn.svm import SVC as cuMLSVC
-    CUMLOK = False
+    CUML_AVAILABLE = False
+    if "UnsupportedCUDAError" in str(type(e)):
+        print("⚠️  cuML not compatible with this GPU (P100 detected). Using sklearn SVC on CPU.")
+    else:
+        print("⚠️  cuML not available. Using sklearn SVC as fallback.")
 from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
@@ -59,14 +66,17 @@ class OptimizedQuantumSVC:
         """Create quantum device, prefer JAX GPU if available"""
         try:
             import jax
-            from jax.lib import xla_bridge
-            if xla_bridge.get_backend().platform == 'gpu':
-                print("Using PennyLane JAX GPU backend for quantum simulation.")
+            # Check if JAX can detect GPU
+            gpu_devices = jax.devices('gpu')
+            if len(gpu_devices) > 0:
+                print(f"✅ Using PennyLane JAX GPU backend ({gpu_devices[0].device_kind}).")
                 return qml.device("default.qubit.jax", wires=n_qubits, shots=None)
             else:
-                print("JAX found but no GPU detected, using default.qubit.")
+                print("JAX available but no GPU detected, using default.qubit.")
+        except ImportError:
+            print("JAX not installed. Using default.qubit (CPU). Install JAX for GPU acceleration.")
         except Exception as e:
-            print(f"JAX not available or failed to initialize: {e}. Using default.qubit.")
+            print(f"JAX initialization warning: {e}. Falling back to default.qubit.")
         return qml.device("default.qubit", wires=n_qubits)
     
     def feature_map(self, x, n_qubits):
@@ -459,6 +469,11 @@ class OptimizedQuantumSVC:
         
         # Step 5: Train SVM with grid search
         print("\n5. Training SVM with grid search...")
+        if CUML_AVAILABLE:
+            print("   Using cuML GPU-accelerated SVC")
+        else:
+            print("   Using sklearn SVC (CPU fallback)")
+        
         svc = cuMLSVC(kernel="precomputed", class_weight="balanced", probability=True)
 
         # Expanded C values for better tuning

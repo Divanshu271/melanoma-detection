@@ -5,7 +5,12 @@ Optimized for >90% precision, recall, and accuracy
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
-from sklearn.svm import SVC
+try:
+    from cuml.svm import SVC as cuMLSVC
+    CUMLOK = True
+except ImportError:
+    from sklearn.svm import SVC as cuMLSVC
+    CUMLOK = False
 from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
@@ -51,7 +56,17 @@ class OptimizedQuantumSVC:
         self.X_train_pca = None  # Store training samples in PCA space for kernel computation
         
     def create_quantum_device(self, n_qubits):
-        """Create quantum device"""
+        """Create quantum device, prefer JAX GPU if available"""
+        try:
+            import jax
+            from jax.lib import xla_bridge
+            if xla_bridge.get_backend().platform == 'gpu':
+                print("Using PennyLane JAX GPU backend for quantum simulation.")
+                return qml.device("default.qubit.jax", wires=n_qubits, shots=None)
+            else:
+                print("JAX found but no GPU detected, using default.qubit.")
+        except Exception as e:
+            print(f"JAX not available or failed to initialize: {e}. Using default.qubit.")
         return qml.device("default.qubit", wires=n_qubits)
     
     def feature_map(self, x, n_qubits):
@@ -444,11 +459,11 @@ class OptimizedQuantumSVC:
         
         # Step 5: Train SVM with grid search
         print("\n5. Training SVM with grid search...")
-        svc = SVC(kernel="precomputed", class_weight="balanced", probability=True)
-        
+        svc = cuMLSVC(kernel="precomputed", class_weight="balanced", probability=True)
+
         # Expanded C values for better tuning
         expanded_C = C_values + [0.5, 5, 50, 500] if len(C_values) <= 4 else C_values
-        
+
         grid = GridSearchCV(
             svc,
             {"C": expanded_C},
@@ -474,10 +489,10 @@ class OptimizedQuantumSVC:
         except Exception as e:
             # If calibration fails, keep original SVC
             print(f"   Calibration failed: {e}. Continuing without calibration.")
-        
+
         # Store training samples for later kernel computation
         self.X_train_pca = X_tr
-        
+
         # Step 8: Find optimal threshold (use calibrated probabilities if available)
         print("\n8. Finding optimal threshold using calibrated probabilities (mode=balanced_min)...")
         try:
@@ -498,7 +513,7 @@ class OptimizedQuantumSVC:
         except Exception as e:
             print(f"Threshold selection failed: {e}. Falling back to 0.5")
             self.best_threshold = 0.5
-        
+
         return self
     
     def predict(self, X_test, X_train_ref=None, use_threshold=True):

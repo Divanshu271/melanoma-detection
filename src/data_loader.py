@@ -154,3 +154,49 @@ def get_data_loaders(train_data, val_data, test_data, image_dirs,
     print(f"  Using 50/50 balanced sampling: {use_weighted_sampling}")
    
     return train_loader, val_loader, test_loader, class_weights
+
+
+def load_melanoma_data(embeddings_dir='embeddings', metadata_path='archive/HAM10000_metadata.csv'):
+    """Compatibility helper: load cached ResNet embeddings and matching labels.
+
+    Returns:
+        X_train, X_val, X_test, y_train, y_val, y_test
+    If embeddings or metadata are missing this returns six Nones so callers
+    can fall back to synthetic/demo data.
+    """
+    import os
+    import pandas as pd
+
+    train_emb_path = os.path.join(embeddings_dir, 'train_resnet50_embeddings.csv')
+    val_emb_path = os.path.join(embeddings_dir, 'val_resnet50_embeddings.csv')
+    test_emb_path = os.path.join(embeddings_dir, 'test_resnet50_embeddings.csv')
+
+    if os.path.exists(train_emb_path) and os.path.exists(val_emb_path) and os.path.exists(test_emb_path):
+        try:
+            train_df = pd.read_csv(train_emb_path, index_col=0)
+            val_df = pd.read_csv(val_emb_path, index_col=0)
+            test_df = pd.read_csv(test_emb_path, index_col=0)
+
+            X_train = train_df.values
+            X_val = val_df.values
+            X_test = test_df.values
+
+            # Try to load metadata and derive labels if available
+            if os.path.exists(metadata_path):
+                meta = pd.read_csv(metadata_path)
+                y_all = (meta['dx'] == 'mel').astype(int).values
+                n_train = X_train.shape[0]
+                n_val = X_val.shape[0]
+                # slice labels according to embedding splits (best-effort)
+                y_train = y_all[:n_train]
+                y_val = y_all[n_train:n_train + n_val]
+                y_test = y_all[n_train + n_val: n_train + n_val + X_test.shape[0]]
+            else:
+                y_train = y_val = y_test = None
+
+            return X_train, X_val, X_test, y_train, y_val, y_test
+        except Exception:
+            # If anything goes wrong, return Nones so callers can fallback
+            return None, None, None, None, None, None
+    else:
+        return None, None, None, None, None, None

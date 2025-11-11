@@ -113,3 +113,7 @@ class ResNet50EmbeddingExtractor:
         print(f"✅ Extracted {len(embeddings)} embeddings of dimension {embeddings[0].shape[0]}")
         return embedding_df
 
+
+# Compatibility alias for historical imports
+ResNet50Extractor = ResNet50EmbeddingExtractor
+

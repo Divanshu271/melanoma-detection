@@ -11,7 +11,7 @@ from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score
 )
-from metrics_utils import classification_metrics
+from src.metrics_utils import classification_metrics
 import warnings
 warnings.filterwarnings('ignore')
 

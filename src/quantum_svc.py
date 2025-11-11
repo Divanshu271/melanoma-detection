@@ -18,7 +18,7 @@ import pennylane as qml
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
-from metrics_utils import classification_metrics
+from src.metrics_utils import classification_metrics
 
 class OptimizedQuantumSVC:
     """

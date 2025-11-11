@@ -118,11 +118,12 @@ class OptimizedQNN(nn.Module):
         )
         # Best decision threshold (for positive class) chosen on validation
         self.best_threshold = 0.5
-        # Threshold tuning behavior: 'recall' (default) or 'precision' or 'f1'
+    # Threshold tuning behavior: 'balanced_min' (default) or 'recall' or 'precision' or 'f1'
         # If 'recall', we maximize recall subject to min_precision.
         # If 'precision', we maximize precision subject to min_recall.
         # If 'f1', we maximize F1 directly (no additional constraint used).
-        self.threshold_optimize = 'recall'
+    # 'balanced_min' maximizes min(precision, recall) to get balanced performance
+        self.threshold_optimize = 'balanced_min'
         self.min_precision = 0.5
         self.min_recall = 0.0
         # Optional use of focal loss
@@ -345,7 +346,7 @@ class OptimizedQNN(nn.Module):
 
         # candidate arrays
         thresholds = np.linspace(0.0, 1.0, 101)
-        from sklearn.metrics import precision_score, recall_score, f1_score
+        from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score
 
         scores = []
         for t in thresholds:
@@ -353,9 +354,10 @@ class OptimizedQNN(nn.Module):
             prec = precision_score(all_labels, y_pred, zero_division=0)
             rec = recall_score(all_labels, y_pred, zero_division=0)
             f1 = f1_score(all_labels, y_pred, zero_division=0)
-            scores.append((float(t), float(prec), float(rec), float(f1)))
+            bal = balanced_accuracy_score(all_labels, y_pred)
+            scores.append((float(t), float(prec), float(rec), float(f1), float(bal)))
 
-        # Filter according to requested objective and constraints
+        # Selection modes: 'recall', 'precision', 'f1', 'balanced_min'
         selected = None
         if optimize_for == 'recall':
             # keep thresholds that meet precision constraint
@@ -379,6 +381,11 @@ class OptimizedQNN(nn.Module):
                 # fallback: maximize precision regardless of recall
                 scores.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
                 selected = scores[0]
+
+        elif optimize_for == 'balanced_min':
+            # choose threshold that maximizes min(precision, recall)
+            scores.sort(key=lambda x: (min(x[1], x[2]), x[4], x[3]), reverse=True)
+            selected = scores[0]
 
         else:  # f1
             scores.sort(key=lambda x: x[3], reverse=True)

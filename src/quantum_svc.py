@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score, 
     f1_score, balanced_accuracy_score, precision_score, recall_score, accuracy_score
@@ -44,6 +45,7 @@ class OptimizedQuantumSVC:
         self.pca = None
         self.scaler = None
         self.svc = None
+        self.calibrator = None
         self.best_threshold = 0.5
         self.device = None
         self.X_train_pca = None  # Store training samples in PCA space for kernel computation
@@ -308,63 +310,65 @@ class OptimizedQuantumSVC:
         
         return X_train_pca, X_val_pca, X_test_pca
     
-    def find_optimal_threshold(self, y_true, y_scores, target_precision=0.90, target_recall=0.90):
+    def find_optimal_threshold(self, y_true, y_scores, target_precision=0.90, target_recall=0.90, mode='composite'):
         """
-        Find optimal threshold for >90% precision and recall
-        Uses balanced scoring to avoid bias toward either metric
+        Find optimal threshold for tuning decision threshold from scores/probabilities.
+
+        Modes supported:
+        - 'composite' (default): original composite score that mixes F1 and balanced accuracy.
+        - 'balanced_min': maximize min(precision, recall) (i.e., improve the weaker metric).
+        - 'f1': maximize F1 score.
+        - 'balanced_acc': maximize balanced accuracy.
         """
         thresholds = np.linspace(min(y_scores), max(y_scores), 300)  # More granular search
         best_score = -1
         best_threshold = 0.5
         best_precision = 0
         best_recall = 0
-        
+
         for t in thresholds:
             y_pred = (y_scores >= t).astype(int)
-            
+
             if len(np.unique(y_pred)) < 2:
                 continue
-            
+
             prec = precision_score(y_true, y_pred, zero_division=0)
             rec = recall_score(y_true, y_pred, zero_division=0)
             # Use positive-class (binary) F1 when tuning thresholds
             f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
             balanced_acc = balanced_accuracy_score(y_true, y_pred)
-            
-            # Balanced scoring that equally weights precision and recall
-            # Harmonic mean of precision and recall (F1) as base
-            base_score = f1
-            
-            # Bonus for meeting both targets
-            if prec >= target_precision and rec >= target_recall:
-                # Both targets met - highest priority
-                score = base_score * 4.0
-                # Extra bonus for balanced accuracy
-                score += balanced_acc * 2.0
-                if prec >= 0.95 and rec >= 0.95:
-                    score *= 1.5  # Extra bonus for >95%
-            elif prec >= target_precision and rec >= 0.85:
-                # Precision met, recall good
-                score = base_score * 2.5 + (rec / target_recall) * 0.5
-            elif rec >= target_recall and prec >= 0.85:
-                # Recall met, precision good
-                score = base_score * 2.5 + (prec / target_precision) * 0.5
-            elif prec >= 0.85 and rec >= 0.85:
-                # Both close to target
-                score = base_score * 2.0 + balanced_acc
-            else:
-                # Weight by how close to both targets
-                prec_ratio = prec / target_precision
-                rec_ratio = rec / target_recall
-                min_ratio = min(prec_ratio, rec_ratio)  # Penalize imbalance
-                score = base_score * (1 + min_ratio) + balanced_acc * 0.5
-            
+
+            # Scoring modes
+            if mode == 'balanced_min':
+                # maximize the minimum of precision and recall
+                score = min(prec, rec)
+            elif mode == 'f1':
+                score = f1
+            elif mode == 'balanced_acc':
+                score = balanced_acc
+            else:  # composite (legacy)
+                base_score = f1
+                # Composite scoring that prefers meeting targets and balanced accuracy
+                if prec >= target_precision and rec >= target_recall:
+                    score = base_score * 4.0 + balanced_acc * 2.0
+                elif prec >= target_precision and rec >= 0.85:
+                    score = base_score * 2.5 + (rec / target_recall) * 0.5
+                elif rec >= target_recall and prec >= 0.85:
+                    score = base_score * 2.5 + (prec / target_precision) * 0.5
+                elif prec >= 0.85 and rec >= 0.85:
+                    score = base_score * 2.0 + balanced_acc
+                else:
+                    prec_ratio = prec / target_precision
+                    rec_ratio = rec / target_recall
+                    min_ratio = min(prec_ratio, rec_ratio)
+                    score = base_score * (1 + min_ratio) + balanced_acc * 0.5
+
             if score > best_score:
                 best_score = score
                 best_threshold = t
                 best_precision = prec
                 best_recall = rec
-        
+
         return best_threshold, best_precision, best_recall
     
     def train(self, X_train, y_train, X_val, y_val, 
@@ -398,13 +402,35 @@ class OptimizedQuantumSVC:
         print("\n2. Applying PCA...")
         X_train_pca, X_val_pca, _ = self.apply_pca(X_train_norm, X_val_norm)
         
-        # Step 3: Balanced subsampling
-        print(f"\n3. Creating balanced subsamples...")
+        # Step 3: Balanced subsampling for training only
+        # Keep validation set in its original (imbalanced) distribution for
+        # calibration and threshold selection so thresholds generalize to test.
+        print(f"\n3. Creating balanced subsamples for training (validation kept original)...")
         X_tr, y_tr = self.balanced_subsample(X_train_pca, y_train, n_samples_per_class=n_train_samples//2)
-        X_va, y_va = self.balanced_subsample(X_val_pca, y_val, n_samples_per_class=n_val_samples//2)
-        
-        print(f"   Train: {X_tr.shape}, Class balance: {np.bincount(y_tr)}")
-        print(f"   Val: {X_va.shape}, Class balance: {np.bincount(y_va)}")
+
+        # For validation, prefer to keep the original distribution; optionally
+        # allow a capped subset while preserving class ratios to reduce kernel cost.
+        if X_val_pca is not None and y_val is not None:
+            # If a cap is requested, perform a stratified downsample preserving ratios
+            max_val = n_val_samples
+            if len(y_val) > max_val:
+                # stratified subsample
+                from sklearn.model_selection import StratifiedShuffleSplit
+                sss = StratifiedShuffleSplit(n_splits=1, test_size=max_val, random_state=self.random_state)
+                for _, idx in sss.split(X_val_pca, y_val):
+                    X_va = X_val_pca[idx]
+                    y_va = y_val[idx]
+            else:
+                X_va = X_val_pca
+                y_va = y_val
+        else:
+            X_va, y_va = None, None
+
+        print(f"   Train (balanced): {X_tr.shape}, Class balance: {np.bincount(y_tr)}")
+        if X_va is not None:
+            print(f"   Val (original distribution): {X_va.shape}, Class balance: {np.bincount(y_va)}")
+        else:
+            print("   Val: None provided")
         
         # Step 4: Compute quantum kernels (hybrid if enabled)
         print("\n4. Computing kernels...")
@@ -424,31 +450,54 @@ class OptimizedQuantumSVC:
         expanded_C = C_values + [0.5, 5, 50, 500] if len(C_values) <= 4 else C_values
         
         grid = GridSearchCV(
-            svc, 
-            {"C": expanded_C}, 
-            cv=cv, 
-            scoring="roc_auc", 
-            n_jobs=-1,
+            svc,
+            {"C": expanded_C},
+            cv=cv,
+            scoring="balanced_accuracy",  # prefer balanced performance across classes
+            n_jobs=n_jobs,
             verbose=1
         )
         grid.fit(K_train, y_tr)
-        
+
         self.svc = grid.best_estimator_
-        print(f"✅ Best C: {grid.best_params_['C']}, CV AUC: {grid.best_score_:.4f}")
+        print(f"✅ Best C: {grid.best_params_['C']}, CV balanced_acc: {grid.best_score_:.4f}")
+
+        # Optionally calibrate probabilities using validation data to get well-calibrated
+        # probability estimates (helps threshold selection). Use 'sigmoid' (Platt) calibration.
+        try:
+            print("\n7. Calibrating probabilities on validation set (sigmoid)...")
+            calibrator = CalibratedClassifierCV(self.svc, cv='prefit', method='sigmoid')
+            # K_val is the precomputed kernel between X_va and X_tr
+            calibrator.fit(K_val, y_va)
+            self.calibrator = calibrator
+            print("   Calibration complete.")
+        except Exception as e:
+            # If calibration fails, keep original SVC
+            print(f"   Calibration failed: {e}. Continuing without calibration.")
         
         # Store training samples for later kernel computation
         self.X_train_pca = X_tr
         
-        # Step 6: Find optimal threshold
-        print("\n6. Finding optimal threshold for >90% metrics...")
-        val_scores = self.svc.decision_function(K_val)
-        self.best_threshold, val_prec, val_rec = self.find_optimal_threshold(
-            y_va, val_scores, target_precision=0.90, target_recall=0.90
-        )
-        
-        print(f"✅ Optimal threshold: {self.best_threshold:.4f}")
-        print(f"   Val Precision: {val_prec:.4f} ({val_prec*100:.2f}%)")
-        print(f"   Val Recall: {val_rec:.4f} ({val_rec*100:.2f}%)")
+        # Step 8: Find optimal threshold (use calibrated probabilities if available)
+        print("\n8. Finding optimal threshold using calibrated probabilities (mode=balanced_min)...")
+        try:
+            if self.calibrator is not None:
+                probs = self.calibrator.predict_proba(K_val)[:, 1]
+            else:
+                # fallback to decision function (not calibrated)
+                probs = self.svc.decision_function(K_val)
+
+            # Use mode 'balanced_min' to maximize the weaker of precision/recall
+            self.best_threshold, val_prec, val_rec = self.find_optimal_threshold(
+                y_va, probs, target_precision=0.90, target_recall=0.90, mode='balanced_min'
+            )
+
+            print(f"✅ Optimal threshold: {self.best_threshold:.4f}")
+            print(f"   Val Precision: {val_prec:.4f} ({val_prec*100:.2f}%)")
+            print(f"   Val Recall: {val_rec:.4f} ({val_rec*100:.2f}%)")
+        except Exception as e:
+            print(f"Threshold selection failed: {e}. Falling back to 0.5")
+            self.best_threshold = 0.5
         
         return self
     
@@ -480,14 +529,19 @@ class OptimizedQuantumSVC:
         # Compute kernel: test samples vs training samples (hybrid if enabled)
         K_test = self.hybrid_kernel(X_test_pca, X_train_ref_pca, verbose=False)
         
-        # Get decision scores
-        scores = self.svc.decision_function(K_test)
-        
+        # Get scores/probabilities
+        if self.calibrator is not None:
+            probs = self.calibrator.predict_proba(K_test)[:, 1]
+            scores = probs
+        else:
+            scores = self.svc.decision_function(K_test)
+
         if use_threshold:
             predictions = (scores >= self.best_threshold).astype(int)
         else:
+            # if not using threshold, use the SVC's native prediction
             predictions = self.svc.predict(K_test)
-        
+
         return predictions, scores
     
     def evaluate(self, X_test, y_test):
@@ -591,16 +645,19 @@ class OptimizedQuantumSVC:
 
         K_test = self.hybrid_kernel(X_test_pca, X_train_ref_pca, verbose=False)
 
+        # Prefer calibrated probabilities if available
+        if self.calibrator is not None:
+            probs = self.calibrator.predict_proba(K_test)
+            return probs
+
         # If classifier supports predict_proba use it
         try:
             probs = self.svc.predict_proba(K_test)
-            # return full probability matrix (n_samples, n_classes)
             return probs
         except Exception:
             # Fallback: decision function -> map to (0,1) via sigmoid
             scores = self.svc.decision_function(K_test)
             probs = 1.0 / (1.0 + np.exp(-scores))
-            # Return two-column probability matrix [P(class0), P(class1)]
             probs_matrix = np.vstack([1.0 - probs, probs]).T
             return probs_matrix
 

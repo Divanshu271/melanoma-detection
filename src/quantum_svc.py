@@ -5,19 +5,7 @@ Optimized for >90% precision, recall, and accuracy
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
-
-# Attempt to use cuML GPU SVC, with fallback to sklearn for older GPUs
-try:
-    from cuml.svm import SVC as cuMLSVC
-    CUML_AVAILABLE = True
-except (ImportError, Exception) as e:
-    # Fall back to sklearn SVC if cuML is not available or incompatible
-    from sklearn.svm import SVC as cuMLSVC
-    CUML_AVAILABLE = False
-    if "UnsupportedCUDAError" in str(type(e)):
-        print("⚠️  cuML not compatible with this GPU (P100 detected). Using sklearn SVC on CPU.")
-    else:
-        print("⚠️  cuML not available. Using sklearn SVC as fallback.")
+from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
@@ -63,20 +51,7 @@ class OptimizedQuantumSVC:
         self.X_train_pca = None  # Store training samples in PCA space for kernel computation
         
     def create_quantum_device(self, n_qubits):
-        """Create quantum device, prefer JAX GPU if available"""
-        try:
-            import jax
-            # Check if JAX can detect GPU
-            gpu_devices = jax.devices('gpu')
-            if len(gpu_devices) > 0:
-                print(f"✅ Using PennyLane JAX GPU backend ({gpu_devices[0].device_kind}).")
-                return qml.device("default.qubit.jax", wires=n_qubits, shots=None)
-            else:
-                print("JAX available but no GPU detected, using default.qubit.")
-        except ImportError:
-            print("JAX not installed. Using default.qubit (CPU). Install JAX for GPU acceleration.")
-        except Exception as e:
-            print(f"JAX initialization warning: {e}. Falling back to default.qubit.")
+        """Create quantum device"""
         return qml.device("default.qubit", wires=n_qubits)
     
     def feature_map(self, x, n_qubits):
@@ -469,16 +444,11 @@ class OptimizedQuantumSVC:
         
         # Step 5: Train SVM with grid search
         print("\n5. Training SVM with grid search...")
-        if CUML_AVAILABLE:
-            print("   Using cuML GPU-accelerated SVC")
-        else:
-            print("   Using sklearn SVC (CPU fallback)")
+        svc = SVC(kernel="precomputed", class_weight="balanced", probability=True)
         
-        svc = cuMLSVC(kernel="precomputed", class_weight="balanced", probability=True)
-
         # Expanded C values for better tuning
         expanded_C = C_values + [0.5, 5, 50, 500] if len(C_values) <= 4 else C_values
-
+        
         grid = GridSearchCV(
             svc,
             {"C": expanded_C},
@@ -504,10 +474,10 @@ class OptimizedQuantumSVC:
         except Exception as e:
             # If calibration fails, keep original SVC
             print(f"   Calibration failed: {e}. Continuing without calibration.")
-
+        
         # Store training samples for later kernel computation
         self.X_train_pca = X_tr
-
+        
         # Step 8: Find optimal threshold (use calibrated probabilities if available)
         print("\n8. Finding optimal threshold using calibrated probabilities (mode=balanced_min)...")
         try:
@@ -528,7 +498,7 @@ class OptimizedQuantumSVC:
         except Exception as e:
             print(f"Threshold selection failed: {e}. Falling back to 0.5")
             self.best_threshold = 0.5
-
+        
         return self
     
     def predict(self, X_test, X_train_ref=None, use_threshold=True):

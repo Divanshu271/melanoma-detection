@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, precision_score, recall_score,
     f1_score, roc_auc_score, confusion_matrix, classification_report
@@ -202,6 +203,65 @@ def optimize_ensemble_blend(
     return best['weights'], best['threshold'], best['metrics']
 
 
+def attach_labels_to_embeddings(csv_path, metadata_map, split_name=""):
+    """
+    Load embeddings from CSV and align labels using metadata image IDs.
+    Drops samples lacking metadata to avoid misaligned splits.
+    """
+    df = pd.read_csv(csv_path, index_col=0)
+    df.index = df.index.astype(str)
+    
+    missing_ids = df.index.difference(metadata_map.index)
+    if len(missing_ids) > 0:
+        print(f"⚠️  {split_name}: dropping {len(missing_ids)} samples without metadata labels.")
+        df = df.loc[df.index.difference(missing_ids)]
+    
+    if df.empty:
+        raise ValueError(f"{split_name} embeddings became empty after alignment. Check CSV contents.")
+    
+    labels = (metadata_map.loc[df.index, 'dx'].values == 'mel').astype(int)
+    embeddings = df.to_numpy(dtype=np.float32, copy=True)
+    return embeddings, labels
+
+
+def class_counts(y):
+    """Return consistent two-class counts even if a class is missing."""
+    binc = np.bincount(y, minlength=2)
+    return binc
+
+
+def enforce_stratified_splits(X_train, y_train, X_val, y_val, X_test, y_test, random_state=42):
+    """
+    If any split lacks a class, rebuild train/val/test via stratified shuffles
+    preserving original split sizes.
+    """
+    def has_both(y):
+        return len(np.unique(y)) > 1
+    
+    if all(has_both(split_y) for split_y in (y_train, y_val, y_test)):
+        return X_train, y_train, X_val, y_val, X_test, y_test
+    
+    print("\n⚠️  Detected class-imbalanced splits (missing class). Rebuilding splits via stratified shuffle...")
+    X_all = np.concatenate([X_train, X_val, X_test], axis=0)
+    y_all = np.concatenate([y_train, y_val, y_test], axis=0)
+    
+    n_train, n_val, n_test = len(X_train), len(X_val), len(X_test)
+    
+    sss_test = StratifiedShuffleSplit(n_splits=1, test_size=n_test, random_state=random_state)
+    train_val_idx, test_idx = next(sss_test.split(X_all, y_all))
+    
+    X_temp, y_temp = X_all[train_val_idx], y_all[train_val_idx]
+    X_test_new, y_test_new = X_all[test_idx], y_all[test_idx]
+    
+    sss_val = StratifiedShuffleSplit(n_splits=1, test_size=n_val, random_state=random_state)
+    train_idx, val_idx = next(sss_val.split(X_temp, y_temp))
+    
+    X_train_new, y_train_new = X_temp[train_idx], y_temp[train_idx]
+    X_val_new, y_val_new = X_temp[val_idx], y_temp[val_idx]
+    
+    return X_train_new, y_train_new, X_val_new, y_val_new, X_test_new, y_test_new
+
+
 def main():
     """
     Main heavy ensemble pipeline.
@@ -230,22 +290,28 @@ def main():
     
     try:
         print("Attempting to load cached ResNet50 embeddings...")
-        X_train = pd.read_csv('embeddings/train_resnet50_embeddings.csv', index_col=0).values
-        X_val = pd.read_csv('embeddings/val_resnet50_embeddings.csv', index_col=0).values
-        X_test = pd.read_csv('embeddings/test_resnet50_embeddings.csv', index_col=0).values
-        print(f"✓ Embeddings loaded: Train {X_train.shape}, Val {X_val.shape}, Test {X_test.shape}")
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"✓ Device: {device}")
-        # Enable CuDNN autotuner for potential performance improvements on fixed-size inputs
-        if device.type == 'cuda':
-            torch.backends.cudnn.benchmark = True
-        metadata = pd.read_csv('archive/HAM10000_metadata.csv')
-        y_all = (metadata['dx'] == 'mel').astype(int).values
+        train_path = 'embeddings/train_resnet50_embeddings.csv'
+        val_path = 'embeddings/val_resnet50_embeddings.csv'
+        test_path = 'embeddings/test_resnet50_embeddings.csv'
         
-        n_train, n_val = X_train.shape[0], X_val.shape[0]
-        y_train = y_all[:n_train]
-        y_val = y_all[n_train:n_train+n_val]
-        y_test = y_all[n_train+n_val:]
+        metadata = pd.read_csv('archive/HAM10000_metadata.csv')
+        if 'image_id' not in metadata.columns or 'dx' not in metadata.columns:
+            raise ValueError("Metadata must contain 'image_id' and 'dx' columns.")
+        metadata = metadata[['image_id', 'dx']].drop_duplicates('image_id')
+        metadata['image_id'] = metadata['image_id'].astype(str)
+        metadata_map = metadata.set_index('image_id')
+        
+        X_train, y_train = attach_labels_to_embeddings(train_path, metadata_map, "Train")
+        X_val, y_val = attach_labels_to_embeddings(val_path, metadata_map, "Validation")
+        X_test, y_test = attach_labels_to_embeddings(test_path, metadata_map, "Test")
+        
+        (X_train, y_train,
+         X_val, y_val,
+         X_test, y_test) = enforce_stratified_splits(
+            X_train, y_train, X_val, y_val, X_test, y_test
+        )
+        
+        print(f"✓ Embeddings aligned with metadata: Train {X_train.shape}, Val {X_val.shape}, Test {X_test.shape}")
         
     except Exception as e:
         print(f"⚠️  Could not load real embeddings: {e}")
@@ -268,11 +334,15 @@ def main():
         np.random.shuffle(y_val)
         np.random.shuffle(y_test)
     
+    train_counts = class_counts(y_train)
+    val_counts = class_counts(y_val)
+    test_counts = class_counts(y_test)
+    
     print(f"\nData Summary:")
-    print(f"  Train: {X_train.shape[0]} samples ({np.bincount(y_train)})")
-    print(f"  Val: {X_val.shape[0]} samples ({np.bincount(y_val)})")
-    print(f"  Test: {X_test.shape[0]} samples ({np.bincount(y_test)})")
-    print(f"  Imbalance ratio: {np.bincount(y_train)[1] / len(y_train):.2%}")
+    print(f"  Train: {X_train.shape[0]} samples ({train_counts})")
+    print(f"  Val: {X_val.shape[0]} samples ({val_counts})")
+    print(f"  Test: {X_test.shape[0]} samples ({test_counts})")
+    print(f"  Imbalance ratio: {train_counts[1] / len(y_train):.2%}")
     
     # =========================================================================
     # STEP 2: Build single-pass loaders (GPU-first)

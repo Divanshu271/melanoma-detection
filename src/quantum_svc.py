@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
-from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score, 
@@ -49,6 +48,14 @@ class OptimizedQuantumSVC:
         self.best_threshold = 0.5
         self.device = None
         self.X_train_pca = None  # Store training samples in PCA space for kernel computation
+        self.quantum_weight_grid = [quantum_weight]
+        self.target_precision = 0.90
+        self.target_recall = 0.90
+        self.val_subset_max = None
+        self.calibration_method = 'sigmoid'
+        self.selected_quantum_weight = quantum_weight
+        self.selected_C = C
+        self.validation_metrics = None
         
     def create_quantum_device(self, n_qubits):
         """Create quantum device"""
@@ -182,33 +189,50 @@ class OptimizedQuantumSVC:
             # Use median heuristic for gamma
             if len(X1) > 0:
                 pairwise_dists = np.sqrt(((X1[:, None, :] - X2[None, :, :]) ** 2).sum(axis=2))
-                gamma = 1.0 / np.median(pairwise_dists[pairwise_dists > 0]) if np.any(pairwise_dists > 0) else 1.0
+                valid = pairwise_dists[pairwise_dists > 0]
+                gamma = 1.0 / np.median(valid) if np.any(valid) else 1.0
         return rbf_kernel(X1, X2, gamma=gamma)
     
-    def hybrid_kernel(self, X1, X2, verbose=True):
+    def _normalize_kernel(self, K):
+        """Normalize kernel matrix to [0, 1] to stabilize hybrid weighting."""
+        K = np.asarray(K, dtype=np.float64)
+        k_min = K.min()
+        k_max = K.max()
+        if np.isclose(k_max - k_min, 0.0):
+            return np.ones_like(K, dtype=np.float64)
+        return (K - k_min) / (k_max - k_min + 1e-8)
+    
+    def _combine_kernels(self, K_quantum, K_classical, quantum_weight):
+        """Weighted combination of normalized kernels."""
+        if not self.use_hybrid or K_classical is None:
+            return K_quantum
+        alpha = float(np.clip(quantum_weight, 0.0, 1.0))
+        return alpha * K_quantum + (1 - alpha) * K_classical
+    
+    def hybrid_kernel(self, X1, X2, verbose=True, quantum_weight=None, return_components=False):
         """
-        Hybrid quantum-classical kernel for improved performance
-        Combines quantum kernel with classical RBF kernel
+        Hybrid quantum-classical kernel for improved performance.
+        When `return_components` is True, returns the normalized quantum and classical kernels separately
+        so they can be recombined with different weights without recomputing expensive quantum overlaps.
         """
         # Compute quantum kernel
         K_quantum = self.quantum_kernel(X1, X2, verbose=verbose)
+        K_quantum_norm = self._normalize_kernel(K_quantum)
         
-        if self.use_hybrid:
-            # Compute classical RBF kernel
-            K_classical = self.classical_rbf_kernel(X1, X2)
-            
-            # Normalize both kernels
-            K_quantum_norm = (K_quantum - K_quantum.min()) / (K_quantum.max() - K_quantum.min() + 1e-8)
-            K_classical_norm = (K_classical - K_classical.min()) / (K_classical.max() - K_classical.min() + 1e-8)
-            
-            # Combine with weighted sum
-            K_hybrid = self.quantum_weight * K_quantum_norm + (1 - self.quantum_weight) * K_classical_norm
-            
-            return K_hybrid
-        else:
-            # Normalize quantum kernel only
-            K_quantum_norm = (K_quantum - K_quantum.min()) / (K_quantum.max() - K_quantum.min() + 1e-8)
+        if not self.use_hybrid:
+            if return_components:
+                return K_quantum_norm, None
             return K_quantum_norm
+        
+        # Compute classical RBF kernel
+        K_classical = self.classical_rbf_kernel(X1, X2)
+        K_classical_norm = self._normalize_kernel(K_classical)
+        
+        if return_components:
+            return K_quantum_norm, K_classical_norm
+        
+        weight = self.selected_quantum_weight if quantum_weight is None else quantum_weight
+        return self._combine_kernels(K_quantum_norm, K_classical_norm, weight)
     
     def balanced_subsample(self, X, y, n_samples_per_class=None, random_state=None):
         """
@@ -251,6 +275,30 @@ class OptimizedQuantumSVC:
         y_bal = y_bal[indices]
         
         return X_bal, y_bal
+    
+    def create_balanced_validation_subset(self, X, y, max_total=None):
+        """
+        Build a stratified validation subset with balanced classes and optional size cap.
+        This improves threshold tuning stability on heavily imbalanced splits.
+        """
+        if len(np.unique(y)) < 2:
+            return X, y
+        
+        rng = np.random.RandomState(self.random_state)
+        pos_idx = np.where(y == 1)[0]
+        neg_idx = np.where(y == 0)[0]
+        
+        max_per_class = min(len(pos_idx), len(neg_idx))
+        if max_per_class == 0:
+            return X, y
+        if max_total is not None:
+            max_per_class = min(max_per_class, max_total // 2 if max_total >= 2 else 1)
+        
+        pos_sel = rng.choice(pos_idx, size=max_per_class, replace=False)
+        neg_sel = rng.choice(neg_idx, size=max_per_class, replace=False)
+        subset_idx = np.concatenate([pos_sel, neg_sel])
+        rng.shuffle(subset_idx)
+        return X[subset_idx], y[subset_idx]
     
     def normalize_features(self, X_train, X_val=None, X_test=None, method='robust'):
         """
@@ -371,10 +419,38 @@ class OptimizedQuantumSVC:
 
         return best_threshold, best_precision, best_recall
     
+    def _score_candidate(self, metrics, target_precision, target_recall):
+        """
+        Score QSVC candidate based on validation metrics, heavily rewarding high precision & recall.
+        """
+        precision = metrics['precision']
+        recall = metrics['recall']
+        accuracy = metrics['accuracy']
+        balanced_acc = metrics['balanced_accuracy']
+        f1 = metrics['f1_score']
+        
+        min_metric = min(precision, recall, accuracy)
+        penalty = max(0.0, target_precision - precision) + max(0.0, target_recall - recall)
+        score = min_metric - (penalty * 5.0) + 0.1 * balanced_acc + 0.05 * f1
+        
+        if precision >= target_precision and recall >= target_recall and accuracy >= target_precision:
+            score += 1.0
+        elif precision >= target_precision and recall >= target_recall:
+            score += 0.5
+        elif precision >= target_precision or recall >= target_recall:
+            score += 0.2
+        
+        return score
+    
     def train(self, X_train, y_train, X_val, y_val, 
               n_train_samples=400, n_val_samples=200,
               C_values=[0.1, 1, 10, 100], cv=3, 
-              batch_size=64, n_jobs=-1):
+              batch_size=64, n_jobs=-1,
+              quantum_weight_grid=None,
+              target_precision=0.90,
+              target_recall=0.90,
+              val_subset_max=None,
+              threshold_mode='balanced_min'):
         """
         Train QSVC with optimal hyperparameters and efficient batching
         
@@ -384,11 +460,11 @@ class OptimizedQuantumSVC:
             X_val: Validation features
             y_val: Validation labels
             n_train_samples: Number of training samples per class
-            n_val_samples: Number of validation samples per class
-            C_values: SVM regularization parameters to try
-            cv: Number of cross-validation folds
+            n_val_samples: Max validation samples before balancing subset
+            C_values: SVM regularization parameters explored during single-pass search
+            cv: Unused (kept for backward compatibility)
             batch_size: Size of batches for quantum kernel computation
-            n_jobs: Number of parallel jobs for GridSearchCV
+            n_jobs: Unused placeholder for compatibility
         """
         print("\n" + "="*60)
         print("QSVC Training Pipeline")
@@ -403,113 +479,144 @@ class OptimizedQuantumSVC:
         X_train_pca, X_val_pca, _ = self.apply_pca(X_train_norm, X_val_norm)
         
         # Step 3: Balanced subsampling for training only
-        # Keep validation set in its original (imbalanced) distribution for
-        # calibration and threshold selection so thresholds generalize to test.
-        print(f"\n3. Creating balanced subsamples for training (validation kept original)...")
-        X_tr, y_tr = self.balanced_subsample(X_train_pca, y_train, n_samples_per_class=n_train_samples//2)
-
-        # For validation, prefer to keep the original distribution; optionally
-        # allow a capped subset while preserving class ratios to reduce kernel cost.
-        if X_val_pca is not None and y_val is not None:
-            # If a cap is requested, perform a stratified downsample preserving ratios
-            max_val = n_val_samples
-            if len(y_val) > max_val:
-                # stratified subsample
-                from sklearn.model_selection import StratifiedShuffleSplit
-                sss = StratifiedShuffleSplit(n_splits=1, test_size=max_val, random_state=self.random_state)
-                for _, idx in sss.split(X_val_pca, y_val):
-                    X_va = X_val_pca[idx]
-                    y_va = y_val[idx]
-            else:
-                X_va = X_val_pca
-                y_va = y_val
+        print(f"\n3. Creating balanced subsamples for training & validation tuning...")
+        samples_per_class = max(1, n_train_samples // 2)
+        X_tr, y_tr = self.balanced_subsample(X_train_pca, y_train, n_samples_per_class=samples_per_class)
+        
+        if X_val_pca is None or y_val is None:
+            raise ValueError("Validation data is required for QSVC threshold optimization.")
+        
+        # Stratified cap for validation pool
+        if len(y_val) > n_val_samples:
+            from sklearn.model_selection import StratifiedShuffleSplit
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=n_val_samples, random_state=self.random_state)
+            for _, idx in sss.split(X_val_pca, y_val):
+                X_va_pool = X_val_pca[idx]
+                y_va_pool = y_val[idx]
         else:
-            X_va, y_va = None, None
-
+            X_va_pool, y_va_pool = X_val_pca, y_val
+        
+        # Balanced subset for tuning/calibration (keeps runtime manageable and enforces class parity)
+        subset_cap = val_subset_max or self.val_subset_max or len(y_va_pool)
+        X_va, y_va = self.create_balanced_validation_subset(X_va_pool, y_va_pool, max_total=subset_cap)
+        
         print(f"   Train (balanced): {X_tr.shape}, Class balance: {np.bincount(y_tr)}")
-        if X_va is not None:
-            print(f"   Val (original distribution): {X_va.shape}, Class balance: {np.bincount(y_va)}")
+        print(f"   Val subset (balanced): {X_va.shape}, Class balance: {np.bincount(y_va)}")
+        
+        # Step 4: Compute kernel components once
+        print("\n4. Computing kernels (quantum + classical components)...")
+        K_train_quantum, K_train_classical = self.hybrid_kernel(
+            X_tr, X_tr, verbose=True, return_components=True
+        )
+        K_val_quantum, K_val_classical = self.hybrid_kernel(
+            X_va, X_tr, verbose=True, return_components=True
+        )
+        
+        # Step 5: Single-pass search over quantum weights & C values
+        print("\n5. Optimizing QSVC configuration (single pass, no repeated kernels)...")
+        weight_grid = quantum_weight_grid or self.quantum_weight_grid or [self.quantum_weight]
+        c_grid = C_values if C_values else [self.C]
+        
+        best_candidate = None
+        best_score = -np.inf
+        
+        for weight in weight_grid:
+            K_train_combo = self._combine_kernels(K_train_quantum, K_train_classical, weight)
+            for C_val in c_grid:
+                svc = SVC(
+                    kernel="precomputed",
+                    class_weight="balanced",
+                    probability=False,
+                    C=C_val
+                )
+                svc.fit(K_train_combo, y_tr)
+                
+                K_val_combo = self._combine_kernels(K_val_quantum, K_val_classical, weight)
+                val_scores = svc.decision_function(K_val_combo)
+                threshold, _, _ = self.find_optimal_threshold(
+                    y_va, val_scores,
+                    target_precision=target_precision,
+                    target_recall=target_recall,
+                    mode=threshold_mode
+                )
+                val_preds = (val_scores >= threshold).astype(int)
+                metrics = classification_metrics(y_va, val_preds, val_scores, pos_label=1)
+                candidate_score = self._score_candidate(metrics, target_precision, target_recall)
+                
+                print(f"      weight={weight:.2f}, C={C_val:<6} "
+                      f"| Precision={metrics['precision']:.3f} Recall={metrics['recall']:.3f} "
+                      f"MinMetric={min(metrics['precision'], metrics['recall']):.3f}")
+                
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_candidate = {
+                        'model': svc,
+                        'weight': weight,
+                        'C': C_val,
+                        'threshold': threshold,
+                        'metrics': metrics,
+                        'val_kernel': K_val_combo,
+                        'val_scores': val_scores
+                    }
+        
+        if best_candidate is None:
+            raise RuntimeError("Failed to find a viable QSVC configuration meeting the target constraints.")
+        
+        self.svc = best_candidate['model']
+        self.quantum_weight = best_candidate['weight']
+        self.selected_quantum_weight = best_candidate['weight']
+        self.selected_C = best_candidate['C']
+        self.best_threshold = best_candidate['threshold']
+        self.validation_metrics = best_candidate['metrics']
+        self.calibrator = None
+        
+        print("\n   ✓ Best QSVC configuration:")
+        print(f"     Quantum weight: {self.selected_quantum_weight:.2f}")
+        print(f"     C value: {self.selected_C}")
+        print(f"     Raw validation metrics -> "
+              f"Precision: {self.validation_metrics['precision']:.4f}, "
+              f"Recall: {self.validation_metrics['recall']:.4f}, "
+              f"Acc: {self.validation_metrics['accuracy']:.4f}")
+        
+        # Optional calibration on the balanced validation subset
+        if self.calibration_method:
+            try:
+                print(f"\n6. Calibrating probabilities on balanced validation subset ({self.calibration_method})...")
+                calibrator = CalibratedClassifierCV(self.svc, cv='prefit', method=self.calibration_method)
+                calibrator.fit(best_candidate['val_kernel'], y_va)
+                self.calibrator = calibrator
+                print("   Calibration complete.")
+            except Exception as e:
+                print(f"   Calibration skipped due to error: {e}")
+                self.calibrator = None
+        
+        # Re-run threshold selection using calibrated scores if available
+        print("\n7. Final threshold tuning on balanced validation subset...")
+        if self.calibrator is not None:
+            calibrated_scores = self.calibrator.predict_proba(best_candidate['val_kernel'])[:, 1]
         else:
-            print("   Val: None provided")
+            calibrated_scores = best_candidate['val_scores']
         
-        # Step 4: Compute quantum kernels (hybrid if enabled)
-        print("\n4. Computing kernels...")
-        if self.use_hybrid:
-            print(f"   Using hybrid quantum-classical kernel (quantum weight: {self.quantum_weight})")
-        else:
-            print("   Using pure quantum kernel")
+        self.best_threshold, val_prec, val_rec = self.find_optimal_threshold(
+            y_va, calibrated_scores,
+            target_precision=target_precision,
+            target_recall=target_recall,
+            mode=threshold_mode
+        )
+        final_preds = (calibrated_scores >= self.best_threshold).astype(int)
+        self.validation_metrics = classification_metrics(y_va, final_preds, calibrated_scores, pos_label=1)
         
-        K_train = self.hybrid_kernel(X_tr, X_tr, verbose=True)
-        K_val = self.hybrid_kernel(X_va, X_tr, verbose=True)
+        print(f"   ✓ Final validation metrics (balanced subset):")
+        print(f"     Precision: {self.validation_metrics['precision']:.4f} "
+              f"({self.validation_metrics['precision']*100:.2f}%)")
+        print(f"     Recall:    {self.validation_metrics['recall']:.4f} "
+              f"({self.validation_metrics['recall']*100:.2f}%)")
+        print(f"     Accuracy:  {self.validation_metrics['accuracy']:.4f}")
+        print(f"     Best threshold: {self.best_threshold:.4f}")
         
-        # Step 5: Train SVM (single fit when cv<=1)
-        print("\n5. Training SVM (single-pass)...")
-        base_svc = SVC(kernel="precomputed", class_weight="balanced", probability=True)
-        
-        expanded_C = C_values + [0.5, 5, 50, 500] if len(C_values) <= 4 else C_values
-        
-        if cv is not None and cv > 1 and len(expanded_C) > 1:
-            print(f"   Running GridSearchCV with {cv} folds over {len(expanded_C)} C values...")
-            grid = GridSearchCV(
-                base_svc,
-                {"C": expanded_C},
-                cv=cv,
-                scoring="balanced_accuracy",
-                n_jobs=n_jobs,
-                verbose=1
-            )
-            grid.fit(K_train, y_tr)
-            self.svc = grid.best_estimator_
-            print(f"✅ Best C: {grid.best_params_['C']}, CV balanced_acc: {grid.best_score_:.4f}")
-        else:
-            selected_C = expanded_C[0]
-            print(f"   Grid search disabled (cv={cv}). Fitting once with C={selected_C}.")
-            single_svc = SVC(
-                kernel="precomputed",
-                class_weight="balanced",
-                probability=True,
-                C=selected_C
-            )
-            single_svc.fit(K_train, y_tr)
-            self.svc = single_svc
-            print("✅ Single QSVC fit complete.")
-
-        # Optionally calibrate probabilities using validation data to get well-calibrated
-        # probability estimates (helps threshold selection). Use 'sigmoid' (Platt) calibration.
-        try:
-            print("\n7. Calibrating probabilities on validation set (sigmoid)...")
-            calibrator = CalibratedClassifierCV(self.svc, cv='prefit', method='sigmoid')
-            # K_val is the precomputed kernel between X_va and X_tr
-            calibrator.fit(K_val, y_va)
-            self.calibrator = calibrator
-            print("   Calibration complete.")
-        except Exception as e:
-            # If calibration fails, keep original SVC
-            print(f"   Calibration failed: {e}. Continuing without calibration.")
-        
-        # Store training samples for later kernel computation
+        # Persist training reference
         self.X_train_pca = X_tr
-        
-        # Step 8: Find optimal threshold (use calibrated probabilities if available)
-        print("\n8. Finding optimal threshold using calibrated probabilities (mode=balanced_min)...")
-        try:
-            if self.calibrator is not None:
-                probs = self.calibrator.predict_proba(K_val)[:, 1]
-            else:
-                # fallback to decision function (not calibrated)
-                probs = self.svc.decision_function(K_val)
-
-            # Use mode 'balanced_min' to maximize the weaker of precision/recall
-            self.best_threshold, val_prec, val_rec = self.find_optimal_threshold(
-                y_va, probs, target_precision=0.90, target_recall=0.90, mode='balanced_min'
-            )
-
-            print(f"✅ Optimal threshold: {self.best_threshold:.4f}")
-            print(f"   Val Precision: {val_prec:.4f} ({val_prec*100:.2f}%)")
-            print(f"   Val Recall: {val_rec:.4f} ({val_rec*100:.2f}%)")
-        except Exception as e:
-            print(f"Threshold selection failed: {e}. Falling back to 0.5")
-            self.best_threshold = 0.5
+        self.selected_val_subset = (X_va, y_va)
         
         return self
     

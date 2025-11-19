@@ -54,14 +54,18 @@ class EnsembleConfig:
     
     # QSVC
     qsvc_pca_components = 10
-    qsvc_quantum_weight = 0.25  # favor classical signal for stability
-    qsvc_train_samples = 600  # balanced subsample size
-    qsvc_val_cap = 300  # cap validation (keep distribution original)
-    qsvc_c_values = [250]
+    qsvc_quantum_weight = 0.25  # fallback used if auto-search disabled
+    qsvc_quantum_weight_grid = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    qsvc_train_samples = 400  # balanced subsample size (per-class total = 200)
+    qsvc_val_cap = 300  # initial validation cap before balancing subset
+    qsvc_val_subset_max = 240  # max size (balanced) for threshold/calibration
+    qsvc_c_values = [10, 25, 50, 100, 250, 500, 1000]
     qsvc_cv_folds = 1
     qsvc_calibration = 'sigmoid'  # Platt scaling
     qsvc_threshold_mode = 'balanced_min'
     qsvc_grid_scoring = 'balanced_accuracy'
+    qsvc_target_precision = 0.90
+    qsvc_target_recall = 0.90
     
     # Classical SVM baseline
     svm_pca_components = 10
@@ -154,6 +158,13 @@ class HeavyEnsembleClassifier:
             use_hybrid=True,
             quantum_weight=self.config.qsvc_quantum_weight
         )
+        self.qsvc.quantum_weight_grid = getattr(
+            self.config, 'qsvc_quantum_weight_grid', [self.config.qsvc_quantum_weight]
+        )
+        self.qsvc.target_precision = getattr(self.config, 'qsvc_target_precision', 0.90)
+        self.qsvc.target_recall = getattr(self.config, 'qsvc_target_recall', 0.90)
+        self.qsvc.val_subset_max = getattr(self.config, 'qsvc_val_subset_max', self.config.qsvc_val_cap)
+        self.qsvc.calibration_method = getattr(self.config, 'qsvc_calibration', 'sigmoid')
         
         # Train (uses balanced subsamples + imbalanced val for calibration internally)
         self.qsvc.train(
@@ -163,7 +174,12 @@ class HeavyEnsembleClassifier:
             C_values=self.config.qsvc_c_values,
             cv=self.config.qsvc_cv_folds,
             batch_size=64,
-            n_jobs=-1
+            n_jobs=-1,
+            quantum_weight_grid=self.qsvc.quantum_weight_grid,
+            target_precision=self.qsvc.target_precision,
+            target_recall=self.qsvc.target_recall,
+            val_subset_max=self.qsvc.val_subset_max,
+            threshold_mode=self.config.qsvc_threshold_mode
         )
         
         print(f"✓ QSVC training complete. Threshold: {self.qsvc.best_threshold:.4f}")

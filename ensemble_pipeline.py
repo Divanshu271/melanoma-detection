@@ -57,8 +57,8 @@ class EnsembleConfig:
     qsvc_quantum_weight = 0.25  # favor classical signal for stability
     qsvc_train_samples = 600  # balanced subsample size
     qsvc_val_cap = 300  # cap validation (keep distribution original)
-    qsvc_c_values = [1, 10, 50, 100, 500, 1000, 5000]
-    qsvc_cv_folds = 5
+    qsvc_c_values = [250]
+    qsvc_cv_folds = 1
     qsvc_calibration = 'sigmoid'  # Platt scaling
     qsvc_threshold_mode = 'balanced_min'
     qsvc_grid_scoring = 'balanced_accuracy'

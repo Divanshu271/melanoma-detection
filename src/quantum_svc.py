@@ -442,25 +442,37 @@ class OptimizedQuantumSVC:
         K_train = self.hybrid_kernel(X_tr, X_tr, verbose=True)
         K_val = self.hybrid_kernel(X_va, X_tr, verbose=True)
         
-        # Step 5: Train SVM with grid search
-        print("\n5. Training SVM with grid search...")
-        svc = SVC(kernel="precomputed", class_weight="balanced", probability=True)
+        # Step 5: Train SVM (single fit when cv<=1)
+        print("\n5. Training SVM (single-pass)...")
+        base_svc = SVC(kernel="precomputed", class_weight="balanced", probability=True)
         
-        # Expanded C values for better tuning
         expanded_C = C_values + [0.5, 5, 50, 500] if len(C_values) <= 4 else C_values
         
-        grid = GridSearchCV(
-            svc,
-            {"C": expanded_C},
-            cv=cv,
-            scoring="balanced_accuracy",  # prefer balanced performance across classes
-            n_jobs=n_jobs,
-            verbose=1
-        )
-        grid.fit(K_train, y_tr)
-
-        self.svc = grid.best_estimator_
-        print(f"✅ Best C: {grid.best_params_['C']}, CV balanced_acc: {grid.best_score_:.4f}")
+        if cv is not None and cv > 1 and len(expanded_C) > 1:
+            print(f"   Running GridSearchCV with {cv} folds over {len(expanded_C)} C values...")
+            grid = GridSearchCV(
+                base_svc,
+                {"C": expanded_C},
+                cv=cv,
+                scoring="balanced_accuracy",
+                n_jobs=n_jobs,
+                verbose=1
+            )
+            grid.fit(K_train, y_tr)
+            self.svc = grid.best_estimator_
+            print(f"✅ Best C: {grid.best_params_['C']}, CV balanced_acc: {grid.best_score_:.4f}")
+        else:
+            selected_C = expanded_C[0]
+            print(f"   Grid search disabled (cv={cv}). Fitting once with C={selected_C}.")
+            single_svc = SVC(
+                kernel="precomputed",
+                class_weight="balanced",
+                probability=True,
+                C=selected_C
+            )
+            single_svc.fit(K_train, y_tr)
+            self.svc = single_svc
+            print("✅ Single QSVC fit complete.")
 
         # Optionally calibrate probabilities using validation data to get well-calibrated
         # probability estimates (helps threshold selection). Use 'sigmoid' (Platt) calibration.

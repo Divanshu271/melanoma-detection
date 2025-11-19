@@ -318,40 +318,59 @@ class HeavyEnsembleClassifier:
     
     def predict_ensemble(self, test_loader, X_test_embeddings, apply_threshold=True):
         """
-        Get ensemble predictions from three models.
+        Get ensemble predictions from the available models.
+        Gracefully handles cases where some learners failed to train.
         """
         print("\nGenerating ensemble predictions...")
-        print("  1. QNN probabilities...")
-        qnn_probs = self.get_qnn_probs(test_loader)
+        model_probs = {}
         
-        print("  2. QSVC probabilities...")
-        qsvc_probs = self.get_qsvc_probs(X_test_embeddings)
+        # QNN branch
+        if self.qnn is not None and test_loader is not None:
+            print("  1. QNN probabilities...")
+            model_probs['qnn'] = self.get_qnn_probs(test_loader)
+        else:
+            print("  1. QNN probabilities... skipped (model unavailable)")
         
-        print("  3. Classical SVM probabilities...")
-        svm_probs = self.get_svm_probs(X_test_embeddings)
+        # QSVC branch
+        if self.qsvc is not None and X_test_embeddings is not None:
+            print("  2. QSVC probabilities...")
+            model_probs['qsvc'] = self.get_qsvc_probs(X_test_embeddings)
+        else:
+            print("  2. QSVC probabilities... skipped (model unavailable)")
+        
+        # Classical SVM branch
+        if self.svm_model is not None and self.svm_scaler is not None and X_test_embeddings is not None:
+            print("  3. Classical SVM probabilities...")
+            model_probs['svm'] = self.get_svm_probs(X_test_embeddings)
+        else:
+            print("  3. Classical SVM probabilities... skipped (model unavailable)")
+        
+        if not model_probs:
+            raise RuntimeError("No ensemble members are available for prediction.")
+        
+        # Determine weights only for available models and normalize them
+        raw_weights = {name: self.ensemble_weights.get(name, 0.0) for name in model_probs}
+        total_weight = sum(raw_weights.values())
+        if total_weight <= 0:
+            # fallback to uniform weights
+            normalized_weights = {name: 1.0 / len(model_probs) for name in model_probs}
+            print("  ⚠️  All ensemble weights were zero. Using uniform weighting instead.")
+        else:
+            normalized_weights = {name: raw_weights[name] / total_weight for name in model_probs}
+        
+        print("  4. Soft voting with weights:")
+        for name in model_probs:
+            print(f"     {name.upper()}: {normalized_weights[name]:.1%}")
         
         # Weighted soft voting
-        print("  4. Soft voting with weights:")
-        print(f"     QNN: {self.ensemble_weights['qnn']:.1%}")
-        print(f"     QSVC: {self.ensemble_weights['qsvc']:.1%}")
-        print(f"     SVM: {self.ensemble_weights['svm']:.1%}")
+        ensemble_probs = np.zeros_like(next(iter(model_probs.values())))
+        for name, probs in model_probs.items():
+            ensemble_probs += normalized_weights[name] * probs
         
-        ensemble_probs = (
-            self.ensemble_weights['qnn'] * qnn_probs +
-            self.ensemble_weights['qsvc'] * qsvc_probs +
-            self.ensemble_weights['svm'] * svm_probs
-        )
+        threshold = self.ensemble_threshold if apply_threshold else 0.5
+        preds = (ensemble_probs >= threshold).astype(int)
         
-        if apply_threshold:
-            preds = (ensemble_probs >= self.ensemble_threshold).astype(int)
-        else:
-            preds = (ensemble_probs >= 0.5).astype(int)
-        
-        return preds, ensemble_probs, {
-            'qnn': qnn_probs,
-            'qsvc': qsvc_probs,
-            'svm': svm_probs
-        }
+        return preds, ensemble_probs, model_probs
     
     def evaluate(self, preds, y_true, individual_probs=None):
         """

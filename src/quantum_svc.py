@@ -450,7 +450,8 @@ class OptimizedQuantumSVC:
               target_precision=0.90,
               target_recall=0.90,
               val_subset_max=None,
-              threshold_mode='balanced_min'):
+              threshold_mode='balanced_min',
+              max_candidate_minutes=None):
         """
         Train QSVC with optimal hyperparameters and efficient batching
         
@@ -519,6 +520,12 @@ class OptimizedQuantumSVC:
         
         best_candidate = None
         best_score = -np.inf
+        start_time = time.time()
+        time_limit = None
+        if max_candidate_minutes is None:
+            time_limit = self.max_candidate_minutes
+        else:
+            time_limit = max_candidate_minutes
         
         for weight in weight_grid:
             K_train_combo = self._combine_kernels(K_train_quantum, K_train_classical, weight)
@@ -558,6 +565,26 @@ class OptimizedQuantumSVC:
                         'val_kernel': K_val_combo,
                         'val_scores': val_scores
                     }
+
+                meets_target = (
+                    metrics['precision'] >= target_precision and
+                    metrics['recall'] >= target_recall and
+                    metrics['accuracy'] >= target_precision
+                )
+                if meets_target:
+                    print("   ✓ Target hit on validation subset. Stopping QSVC grid early.")
+                    weight_grid = []
+                    break
+
+                if time_limit is not None:
+                    elapsed_minutes = (time.time() - start_time) / 60.0
+                    if elapsed_minutes >= time_limit:
+                        print(f"   ⚠️  QSVC grid exceeded {time_limit:.1f} minutes. "
+                              "Stopping search with best candidate so far.")
+                        weight_grid = []
+                        break
+            if not weight_grid:
+                break
         
         if best_candidate is None:
             raise RuntimeError("Failed to find a viable QSVC configuration meeting the target constraints.")

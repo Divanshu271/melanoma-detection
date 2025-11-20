@@ -66,6 +66,7 @@ class EnsembleConfig:
     qsvc_grid_scoring = 'balanced_accuracy'
     qsvc_target_precision = 0.90
     qsvc_target_recall = 0.90
+    qsvc_max_candidate_minutes = 40  # bail out of QSVC grid if runtime exceeds limit
     
     # Classical SVM baseline
     svm_pca_components = 10
@@ -165,6 +166,7 @@ class HeavyEnsembleClassifier:
         self.qsvc.target_recall = getattr(self.config, 'qsvc_target_recall', 0.90)
         self.qsvc.val_subset_max = getattr(self.config, 'qsvc_val_subset_max', self.config.qsvc_val_cap)
         self.qsvc.calibration_method = getattr(self.config, 'qsvc_calibration', 'sigmoid')
+        self.qsvc.max_candidate_minutes = getattr(self.config, 'qsvc_max_candidate_minutes', None)
         
         # Train (uses balanced subsamples + imbalanced val for calibration internally)
         self.qsvc.train(

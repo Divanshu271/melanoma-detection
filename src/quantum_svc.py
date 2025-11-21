@@ -528,9 +528,17 @@ class OptimizedQuantumSVC:
         else:
             time_limit = max_candidate_minutes
         
+        total_candidates = len(weight_grid) * len(c_grid)
+        candidate_num = 0
+        print(f"   Searching {total_candidates} candidates (6 weights × {len(c_grid)} C values)...")
+        print(f"   Early stopping: Target (P≥{target_precision:.2f}, R≥{target_recall:.2f}) or {time_limit} min limit\n")
+        
         for weight in weight_grid:
             K_train_combo = self._combine_kernels(K_train_quantum, K_train_classical, weight)
             for C_val in c_grid:
+                candidate_num += 1
+                candidate_start = time.time()
+                
                 svc = SVC(
                     kernel="precomputed",
                     class_weight="balanced",
@@ -551,9 +559,14 @@ class OptimizedQuantumSVC:
                 metrics = classification_metrics(y_va, val_preds, val_scores, pos_label=1)
                 candidate_score = self._score_candidate(metrics, target_precision, target_recall)
                 
-                print(f"      weight={weight:.2f}, C={C_val:<6} "
-                      f"| Precision={metrics['precision']:.3f} Recall={metrics['recall']:.3f} "
-                      f"MinMetric={min(metrics['precision'], metrics['recall']):.3f}")
+                elapsed_candidate = time.time() - candidate_start
+                elapsed_total = (time.time() - start_time) / 60.0
+                remaining = (elapsed_total / candidate_num) * (total_candidates - candidate_num)
+                
+                print(f"   [{candidate_num}/{total_candidates}] weight={weight:.2f}, C={C_val:<6} "
+                      f"| P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
+                      f"Min={min(metrics['precision'], metrics['recall']):.3f} "
+                      f"| Time: {elapsed_total:.1f}m (+{remaining:.1f}m est)")
                 
                 if candidate_score > best_score:
                     best_score = candidate_score
@@ -566,22 +579,37 @@ class OptimizedQuantumSVC:
                         'val_kernel': K_val_combo,
                         'val_scores': val_scores
                     }
+                    print(f"      ⭐ New best! Score: {best_score:.4f}")
 
+                # More lenient early stopping: if we find "good enough" performance
                 meets_target = (
                     metrics['precision'] >= target_precision and
                     metrics['recall'] >= target_recall and
                     metrics['accuracy'] >= target_precision
                 )
+                # Also stop if we find something with both metrics > 0.85 (good enough)
+                good_enough = (
+                    metrics['precision'] >= 0.85 and
+                    metrics['recall'] >= 0.85 and
+                    candidate_num >= 15  # At least try 15 candidates first
+                )
+                
                 if meets_target:
-                    print("   ✓ Target hit on validation subset. Stopping QSVC grid early.")
+                    print(f"\n   ✅ Target hit! Precision≥{target_precision:.2f}, Recall≥{target_recall:.2f}")
+                    print("   Stopping QSVC grid early.")
+                    weight_grid = []
+                    break
+                elif good_enough and candidate_num >= 15:
+                    print(f"\n   ✅ Good enough performance found (P≥0.85, R≥0.85) after {candidate_num} candidates.")
+                    print("   Stopping QSVC grid early.")
                     weight_grid = []
                     break
 
                 if time_limit is not None:
                     elapsed_minutes = (time.time() - start_time) / 60.0
                     if elapsed_minutes >= time_limit:
-                        print(f"   ⚠️  QSVC grid exceeded {time_limit:.1f} minutes. "
-                              "Stopping search with best candidate so far.")
+                        print(f"\n   ⚠️  QSVC grid exceeded {time_limit:.1f} minutes ({candidate_num}/{total_candidates} candidates).")
+                        print("   Stopping search with best candidate so far.")
                         weight_grid = []
                         break
             if not weight_grid:

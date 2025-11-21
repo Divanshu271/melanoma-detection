@@ -4,6 +4,7 @@ Optimized for >90% precision, recall, and accuracy
 """
 import numpy as np
 import pandas as pd
+import time
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 from sklearn.calibration import CalibratedClassifierCV
